@@ -33,12 +33,28 @@ def load_env_file(file_path: str = ".env") -> None:
 
 load_env_file()
 
+
+def parse_positive_int_env(var_name: str, fallback: int) -> int:
+    raw_value = (os.getenv(var_name) or "").strip()
+    if not raw_value:
+        return fallback
+    try:
+        parsed = int(raw_value)
+    except ValueError:
+        print(f"[WARN] Invalid {var_name}={raw_value!r}; using {fallback}.")
+        return fallback
+    if parsed < 1:
+        print(f"[WARN] {var_name} must be >= 1; using {fallback}.")
+        return fallback
+    return parsed
+
+
 DEFAULT_BASE_URL = os.getenv("DEFAULT_BASE_URL", "https://jira.prosv.ru")
 DEFAULT_TOKEN = os.getenv("DEFAULT_TOKEN", "")
+DEFAULT_HOURS = parse_positive_int_env("DEFAULT_HOURS", 4)
+DEFAULT_MAX_DURATION = parse_positive_int_env("DEFAULT_MAX_DURATION", 2)
+DEFAULT_TASK_DAYS_RANGE = parse_positive_int_env("DEFAULT_TASK_DAYS_RANGE", 60)
 INSECURE_SSL_CONTEXT = ssl._create_unverified_context()
-SEARCH_ISSUES_JQL = (
-    "assignee=currentUser() AND statusCategory!=Done AND created>=-60d ORDER BY created DESC"
-)
 DATE_INPUT_FORMAT = "%d.%m.%Y"
 
 
@@ -119,10 +135,15 @@ def request_json(
         raise RuntimeError(f"Non-JSON response for {method} {url}") from exc
 
 
-def fetch_open_issues(headers: dict[str, str], base_url: str) -> list[dict[str, Any]]:
+def fetch_open_issues(
+    headers: dict[str, str], base_url: str, task_days_range: int
+) -> list[dict[str, Any]]:
     url = f"{base_url.rstrip('/')}/rest/api/2/search"
     params = {
-        "jql": SEARCH_ISSUES_JQL,
+        "jql": (
+            "assignee=currentUser() AND statusCategory!=Done "
+            f"AND created>=-{task_days_range}d ORDER BY created DESC"
+        ),
         "fields": "key,summary,description,creator,created,status",
         "startAt": 0,
         "maxResults": 100,
@@ -236,6 +257,61 @@ def ask_weight(issue_key: str, summary: str) -> int:
         if value in {"1", "2", "3", "4", "5"}:
             return int(value)
         print("Weight must be an integer from 1 to 5.")
+
+
+def format_token_for_display(token: str) -> str:
+    if not token:
+        return "<empty>"
+    if len(token) <= 8:
+        return "*" * len(token)
+    return f"{token[:4]}...{token[-4:]}"
+
+
+def ask_use_defaults() -> bool:
+    print("\nDefault values from .env:")
+    print(f"  - Jira base URL [DEFAULT_BASE_URL]: {DEFAULT_BASE_URL}")
+    print(
+        "  - Jira API token [DEFAULT_TOKEN]: "
+        f"{format_token_for_display(DEFAULT_TOKEN)}"
+    )
+    print(f"  - Daily hours [DEFAULT_HOURS]: {DEFAULT_HOURS}")
+    print(f"  - Max duration per entry [DEFAULT_MAX_DURATION]: {DEFAULT_MAX_DURATION}")
+    print(
+        "  - Task lookback in days [DEFAULT_TASK_DAYS_RANGE]: "
+        f"{DEFAULT_TASK_DAYS_RANGE}"
+    )
+    while True:
+        answer = input("Use these defaults? [Y/n]: ").strip().lower()
+        if answer in {"", "y", "yes"}:
+            return True
+        if answer in {"n", "no"}:
+            return False
+        print("Enter Y or N.")
+
+
+def print_issues_table(issues: list[tuple[str, str]]) -> None:
+    if not issues:
+        return
+    index_width = max(len("#"), len(str(len(issues))))
+    key_width = max(len("Issue Key"), max(len(key) for key, _ in issues))
+    summary_width = 90
+    separator = f"+-{'-' * index_width}-+-{'-' * key_width}-+-{'-' * summary_width}-+"
+    print("\nOpen issues:")
+    print(separator)
+    print(
+        f"| {'#'.ljust(index_width)} | {'Issue Key'.ljust(key_width)} | "
+        f"{'Summary'.ljust(summary_width)} |"
+    )
+    print(separator)
+    for index, (key, summary) in enumerate(issues, start=1):
+        summary_value = (
+            summary if len(summary) <= summary_width else f"{summary[:summary_width - 3]}..."
+        )
+        print(
+            f"| {str(index).ljust(index_width)} | {key.ljust(key_width)} | "
+            f"{summary_value.ljust(summary_width)} |"
+        )
+    print(separator)
 
 
 def parse_started_datetime(started: str) -> datetime:
@@ -360,10 +436,11 @@ def main() -> int:
         return 1
 
     base_url = args.base_url.rstrip("/")
+    use_defaults = ask_use_defaults()
 
-    print("Step 1/5: loading open issues for the last 60 days...")
+    print(f"\nStep 1/5: loading open issues for the last {DEFAULT_TASK_DAYS_RANGE} days...")
     try:
-        raw_issues = fetch_open_issues(headers, base_url)
+        raw_issues = fetch_open_issues(headers, base_url, DEFAULT_TASK_DAYS_RANGE)
     except RuntimeError as exc:
         print(f"[ERROR] Failed to fetch issues: {exc}")
         return 1
@@ -372,19 +449,24 @@ def main() -> int:
         print("[ERROR] No open issues found for the configured JQL.")
         return 1
 
-    weighted_issues: list[Issue] = []
+    issue_rows: list[tuple[str, str]] = []
     for item in raw_issues:
         key = item.get("key", "")
         fields = item.get("fields", {}) or {}
-        summary = (fields.get("summary") or "").strip()
-        if not key:
-            continue
-        weight = ask_weight(key, summary or "no summary")
-        weighted_issues.append(Issue(key=key, summary=summary or "no summary", weight=weight))
+        summary = (fields.get("summary") or "").strip() or "no summary"
+        if key:
+            issue_rows.append((key, summary))
 
-    if not weighted_issues:
+    if not issue_rows:
         print("[ERROR] No issues available for generation.")
         return 1
+
+    print_issues_table(issue_rows)
+
+    weighted_issues: list[Issue] = []
+    for key, summary in issue_rows:
+        weight = ask_weight(key, summary)
+        weighted_issues.append(Issue(key=key, summary=summary, weight=weight))
 
     today = datetime.now().date()
     default_start = subtract_one_month(today)
@@ -396,16 +478,22 @@ def main() -> int:
         print("[ERROR] Start date is later than end date.")
         return 1
 
-    print("\nStep 3/5: daily hours.")
-    daily_hours = ask_int("Hours to fill per day", default=4, min_value=1)
-
-    print("\nStep 4/5: maximum duration per entry.")
-    max_task_hours = ask_int("Maximum hours per entry", default=2, min_value=1)
+    print("\nStep 3/5: daily workload settings.")
+    if use_defaults:
+        daily_hours = DEFAULT_HOURS
+        max_task_hours = DEFAULT_MAX_DURATION
+        print(f"Using daily hours [DEFAULT_HOURS]: {daily_hours}")
+        print(f"Using max duration per entry [DEFAULT_MAX_DURATION]: {max_task_hours}")
+    else:
+        daily_hours = ask_int("Hours to fill per day", default=DEFAULT_HOURS, min_value=1)
+        max_task_hours = ask_int(
+            "Maximum hours per entry", default=DEFAULT_MAX_DURATION, min_value=1
+        )
     if max_task_hours > daily_hours:
         print("[ERROR] Max task duration cannot exceed daily hours.")
         return 1
 
-    print("\nStep 5/5: confirmation.")
+    print("\nStep 4/5: confirmation.")
     print_summary(
         weighted_issues, start_date, end_date, daily_hours, max_task_hours, args.dry_run
     )

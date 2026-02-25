@@ -6,19 +6,18 @@ A Python 3.11 CLI utility for generating and sending Jira `worklog` entries usin
 
 ## What It Does
 
-1. Fetches open issues from the last 60 days:
+1. Fetches open issues from the last `DEFAULT_TASK_DAYS_RANGE` days:
    - `assignee=currentUser()`
    - `statusCategory!=Done`
    - `created>=-60d`
-2. Asks for weight `1..5` for each issue (`key + summary`).
-3. Asks for a date range (`dd.mm.yyyy`), defaults:
+2. Shows all fetched issues in a table (`#`, `Issue Key`, `Summary`).
+3. Asks for weight `1..5` for each issue (`key + summary`).
+4. Asks for a date range (`dd.mm.yyyy`), defaults:
    - start: one month ago
    - end: today
-4. Asks for:
-   - hours per day (default `4`)
-   - max hours per single entry (default `2`)
-5. Prints a summary and asks for confirmation.
-6. For each working day (Mon-Fri):
+5. Shows default workload values from `.env` and asks `Use these defaults? [Y/n]`.
+6. Prints a summary and asks for confirmation.
+7. For each working day (Mon-Fri):
    - checks already logged time via JQL:
      - `worklogAuthor=currentUser() AND worklogDate="YYYY-MM-DD"`
    - fills only the remaining time to reach the daily target
@@ -46,6 +45,9 @@ In `.env`:
 
 - `DEFAULT_BASE_URL = "https://jira.domain.example.com"`
 - `DEFAULT_TOKEN = ""`
+- `DEFAULT_HOURS = 4`
+- `DEFAULT_MAX_DURATION = 2`
+- `DEFAULT_TASK_DAYS_RANGE = 60`
 
 You can:
 
@@ -99,7 +101,16 @@ Example:
 
 ```text
 $ python3 timesheet.py --dry-run --token "***"
+Default workload values from .env:
+  - DEFAULT_HOURS=4
+  - DEFAULT_MAX_DURATION=2
+Use these defaults? [Y/n]:
+
 Step 1/5: loading open issues for the last 60 days...
+Open issues:
+| # | Issue Key | Summary |
+| 1 | TASK-123  | Fix parser bug |
+| 2 | TASK-456  | Refactor importer |
 Weight for TASK-123 (Fix parser bug) [1-5]: 5
 Weight for TASK-456 (Refactor importer) [1-5]: 2
 
@@ -107,13 +118,11 @@ Step 2/5: period dates.
 Start date [25.01.2026]:
 End date [25.02.2026]:
 
-Step 3/5: daily hours.
-Hours to fill per day [4]:
+Step 3/5: daily workload settings.
+Using DEFAULT_HOURS=4
+Using DEFAULT_MAX_DURATION=2
 
-Step 4/5: maximum duration per entry.
-Maximum hours per entry [2]:
-
-Step 5/5: confirmation.
+Step 4/5: confirmation.
 ... summary ...
 Confirm run? [y/n]: y
 [DAY] 2026-02-23 logged=1.00h to_add=3.00h
