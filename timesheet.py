@@ -84,6 +84,11 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_BASE_URL,
         help="Jira base URL.",
     )
+    parser.add_argument(
+        "--manager",
+        action="store_true",
+        help="Non-interactive: random weights 1-5, default dates/workload, confirm only.",
+    )
     return parser.parse_args()
 
 
@@ -436,7 +441,7 @@ def main() -> int:
         return 1
 
     base_url = args.base_url.rstrip("/")
-    use_defaults = ask_use_defaults()
+    use_defaults = False if args.manager else ask_use_defaults()
 
     print(f"\nStep 1/5: loading open issues for the last {DEFAULT_TASK_DAYS_RANGE} days...")
     try:
@@ -465,21 +470,25 @@ def main() -> int:
 
     weighted_issues: list[Issue] = []
     for key, summary in issue_rows:
-        weight = ask_weight(key, summary)
+        weight = random.randint(1, 5) if args.manager else ask_weight(key, summary)
         weighted_issues.append(Issue(key=key, summary=summary, weight=weight))
 
     today = datetime.now().date()
     default_start = subtract_one_month(today)
 
     print("\nStep 2/5: period dates.")
-    start_date = ask_date("Start date", default_start)
-    end_date = ask_date("End date", today)
+    if args.manager:
+        start_date = default_start
+        end_date = today
+    else:
+        start_date = ask_date("Start date", default_start)
+        end_date = ask_date("End date", today)
     if start_date > end_date:
         print("[ERROR] Start date is later than end date.")
         return 1
 
     print("\nStep 3/5: daily workload settings.")
-    if use_defaults:
+    if args.manager or use_defaults:
         daily_hours = DEFAULT_HOURS
         max_task_hours = DEFAULT_MAX_DURATION
         print(f"Using daily hours [DEFAULT_HOURS]: {daily_hours}")

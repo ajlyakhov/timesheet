@@ -74,6 +74,12 @@ With custom URL:
 python3 timesheet.py --token "<JIRA_TOKEN>" --base-url "https://jira.domain.example.com"
 ```
 
+Manager mode (minimal interaction: random weights 1-5, default dates/workload, confirm only):
+
+```bash
+python3 timesheet.py --manager --token "<JIRA_TOKEN>"
+```
+
 ## Payload Format
 
 POST to:
