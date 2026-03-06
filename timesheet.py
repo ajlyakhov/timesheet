@@ -3,17 +3,22 @@ from __future__ import annotations
 
 import argparse
 import calendar
+import html
+import http.server
 import json
 import os
 import random
 import ssl
 import sys
+import threading
+import time
+import webbrowser
 import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
-from datetime import date, datetime, time, timedelta, timezone
-from typing import Any
+from datetime import date, datetime, time as dt_time, timedelta, timezone
+from typing import Any, Callable
 
 def load_env_file(file_path: str = ".env") -> None:
     try:
@@ -54,6 +59,7 @@ DEFAULT_TOKEN = os.getenv("DEFAULT_TOKEN", "")
 DEFAULT_HOURS = parse_positive_int_env("DEFAULT_HOURS", 4)
 DEFAULT_MAX_DURATION = parse_positive_int_env("DEFAULT_MAX_DURATION", 2)
 DEFAULT_TASK_DAYS_RANGE = parse_positive_int_env("DEFAULT_TASK_DAYS_RANGE", 60)
+GUI_PORT = parse_positive_int_env("GUI_PORT", 8080)
 INSECURE_SSL_CONTEXT = ssl._create_unverified_context()
 DATE_INPUT_FORMAT = "%d.%m.%Y"
 
@@ -88,6 +94,11 @@ def parse_args() -> argparse.Namespace:
         "--manager",
         action="store_true",
         help="Non-interactive: random weights 1-5, default dates/workload, confirm only.",
+    )
+    parser.add_argument(
+        "--gui",
+        action="store_true",
+        help="Start web interface instead of CLI.",
     )
     return parser.parse_args()
 
@@ -379,7 +390,7 @@ def build_day_payloads(
     issue_weights = [x.weight for x in issues]
 
     payloads: list[tuple[str, dict[str, Any]]] = []
-    current_dt = datetime.combine(day, time(hour=10, minute=0, second=0)).replace(
+    current_dt = datetime.combine(day, dt_time(hour=10, minute=0, second=0)).replace(
         tzinfo=timezone(timedelta(hours=3))
     )
 
@@ -432,8 +443,396 @@ def ask_confirmation() -> bool:
         print("Enter y or n.")
 
 
+def run_timesheet(
+    headers: dict[str, str],
+    base_url: str,
+    weighted_issues: list[Issue],
+    start_date: date,
+    end_date: date,
+    daily_hours: int,
+    max_task_hours: int,
+    dry_run: bool = False,
+    progress_callback: Callable[[date, int, int, int, int], None] | None = None,
+) -> tuple[int, int, int]:
+    """Run timesheet logic. Returns (created, skipped_days, errors)."""
+    days = working_days(start_date, end_date)
+    if not days:
+        return 0, 0, 0
+
+    created = 0
+    skipped_days = 0
+    errors = 0
+
+    for day in days:
+        try:
+            logged_seconds = calculate_logged_seconds_for_day(headers, base_url, day)
+        except RuntimeError:
+            errors += 1
+            if progress_callback:
+                progress_callback(day, 0, created, skipped_days, errors)
+            continue
+
+        target_seconds = daily_hours * 3600
+        remaining_seconds = target_seconds - logged_seconds
+        if remaining_seconds < 3600:
+            skipped_days += 1
+            if progress_callback:
+                progress_callback(day, 0, created, skipped_days, errors)
+            continue
+
+        payloads = build_day_payloads(day, weighted_issues, remaining_seconds, max_task_hours)
+        if not payloads:
+            skipped_days += 1
+            if progress_callback:
+                progress_callback(day, 0, created, skipped_days, errors)
+            continue
+
+        created_this_day = 0
+        for issue_key, payload in payloads:
+            if dry_run:
+                created += 1
+                created_this_day += 1
+                continue
+            try:
+                post_worklog(headers, base_url, issue_key, payload)
+                created += 1
+                created_this_day += 1
+            except RuntimeError:
+                errors += 1
+
+        if progress_callback:
+            progress_callback(day, created_this_day, created, skipped_days, errors)
+
+    return created, skipped_days, errors
+
+
+def _html_page(title: str, body: str) -> str:
+    return f"""<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>{html.escape(title)}</title>
+<style>
+body{{font-family:system-ui,sans-serif;max-width:800px;margin:2em auto;padding:0 1em}}
+table{{border-collapse:collapse;width:100%}}
+th,td{{border:1px solid #ccc;padding:6px;text-align:left}}
+th{{background:#f5f5f5}}
+input,select,button{{margin:4px}}
+button{{padding:8px 16px;cursor:pointer;background:#333;color:#fff;border:none;border-radius:4px}}
+button:hover{{background:#555}}
+.btn-secondary{{background:#666}}
+.btn-secondary:hover{{background:#777}}
+.error{{color:#c00}}
+.success{{color:#060}}
+#progressModal{{display:none;position:fixed;inset:0;background:rgba(0,0,0,.6);align-items:center;justify-content:center;z-index:999;flex-direction:column}}
+#progressModal.show{{display:flex}}
+#progressModal .modal{{max-height:80vh;overflow:hidden;display:flex;flex-direction:column}}
+#progressLog{{max-height:calc(80vh - 80px);overflow-y:auto;font-family:monospace;font-size:12px;margin-top:1em;text-align:left;flex:1;min-height:0}}
+.modal-overlay{{position:fixed;inset:0;background:rgba(0,0,0,.6);display:flex;align-items:center;justify-content:center;z-index:1000}}
+.modal{{background:#fff;padding:2em;border-radius:8px;max-width:400px;text-align:center}}
+.modal h2{{margin-top:0}}
+.modal button{{margin-top:1em}}
+@media (prefers-color-scheme:dark){{
+body{{background:#2a2a2a;color:#0f0}}
+table th,table td{{border-color:#333}}
+th{{background:#111}}
+input,select{{background:#111;color:#0f0;border-color:#333}}
+input[type=date]::-webkit-calendar-picker-indicator{{background:#0f0;color:#000;cursor:pointer;border-radius:2px}}
+input[type=date]::-moz-focus-inner{{border:0}}
+button{{background:#0f0;color:#000}}
+button:hover{{background:#0c0;color:#000}}
+.btn-secondary{{background:#0f0;color:#000}}
+.btn-secondary:hover{{background:#0c0;color:#000}}
+.modal-overlay{{background:rgba(0,0,0,.6)}}
+#progressModal{{background:rgba(0,0,0,.6)}}
+.modal{{background:#000;color:#0f0}}
+.modal button{{background:#0f0;color:#000}}
+#progressModal .modal{{background:#000;color:#0f0}}
+.error{{color:#f66}}
+.success{{color:#0f0}}
+}}
+</style></head><body>
+<h1>{html.escape(title)}</h1>
+{body}
+</body></html>"""
+
+
+def _render_form(
+    issue_rows: list[tuple[str, str]],
+    default_start: date,
+    today: date,
+    error: str = "",
+) -> str:
+    start_str = default_start.strftime("%Y-%m-%d")
+    end_str = today.strftime("%Y-%m-%d")
+    err_html = f'<p class="error">{html.escape(error)}</p>' if error else ""
+    rows_html = ""
+    for key, summary in issue_rows:
+        safe_summary = html.escape(summary[:80] + ("..." if len(summary) > 80 else ""))
+        rows_html += f"""
+<tr>
+  <td>{html.escape(key)}</td>
+  <td>{safe_summary}</td>
+  <td><select name="weight_{html.escape(key)}" class="weight-select"><option value="1">1</option><option value="2">2</option><option value="3" selected>3</option><option value="4">4</option><option value="5">5</option></select></td>
+</tr>"""
+    return f"""{err_html}
+<form id="tsform">
+<p>Start date: <input type="date" name="start_date" value="{start_str}"></p>
+<p>End date: <input type="date" name="end_date" value="{end_str}"></p>
+<p>Issues and weights: <button type="button" class="btn-secondary" id="randomizeBtn">Randomize weights</button></p>
+<table><tr><th>Key</th><th>Summary</th><th>Weight</th></tr>{rows_html}</table>
+<p><button type="submit">Fill timesheet</button></p>
+</form>
+<div id="progressModal" class="modal-overlay">
+  <div class="modal">
+    <h2>Filling timesheet...</h2>
+    <div id="progressLog"></div>
+  </div>
+</div>
+<div id="modalOverlay" class="modal-overlay" style="display:none">
+  <div class="modal">
+    <h2>Import complete</h2>
+    <p id="modalStats"></p>
+    <button id="modalOk">OK</button>
+  </div>
+</div>
+<script>
+(function(){{
+  document.getElementById('randomizeBtn').onclick=function(){{
+    document.querySelectorAll('.weight-select').forEach(function(s){{
+      s.value=Math.floor(Math.random()*5)+1;
+    }});
+  }};
+  var form=document.getElementById('tsform');
+  var progressModal=document.getElementById('progressModal');
+  var log=document.getElementById('progressLog');
+  var modal=document.getElementById('modalOverlay');
+  var modalStats=document.getElementById('modalStats');
+  var modalOk=document.getElementById('modalOk');
+  form.onsubmit=function(e){{
+    e.preventDefault();
+    progressModal.classList.add('show');
+    log.innerHTML='<div>Starting...</div>';
+    var params=new URLSearchParams(new FormData(form));
+    console.log('[timesheet] Submitting...');
+    fetch('/run',{{method:'POST',body:params}}).then(function(r){{
+      if(!r.ok)throw new Error('Server error: '+r.status);
+      return r.json();
+    }}).then(function(d){{
+      if(d.error){{
+        log.innerHTML='<div class="error">'+d.error+'</div>';
+        return;
+      }}
+      var jobId=d.job_id;
+      console.log('[timesheet] Job',jobId);
+      function poll(){{
+        fetch('/status?job_id='+jobId).then(function(r){{
+          return r.json();
+        }}).then(function(s){{
+          if(s.progress&&s.progress.length){{
+            log.innerHTML=s.progress.map(function(p){{return '<div>'+p+'</div>';}}).join('');
+            log.scrollTop=log.scrollHeight;
+          }}
+          if(s.done){{
+            progressModal.classList.remove('show');
+            if(s.error){{
+              log.innerHTML='<div class="error">'+s.error+'</div>';
+              progressModal.classList.add('show');
+              return;
+            }}
+            var stats='Created: '+s.created+' | Skipped: '+s.skipped+' | Errors: '+s.errors;
+            if(s.progress&&s.progress.length)stats+='<br><small>'+s.progress.join(', ')+'</small>';
+            modalStats.innerHTML=stats;
+            modal.style.display='flex';
+            window._finalStats=s;
+          }}else{{
+            setTimeout(poll,400);
+          }}
+        }}).catch(function(err){{
+          console.error('[timesheet] Poll error',err);
+          setTimeout(poll,1000);
+        }});
+      }}
+      poll();
+    }}).catch(function(err){{
+      console.error('[timesheet] Error',err);
+      log.innerHTML='<div class="error">Error: '+err.message+'</div>';
+    }});
+  }};
+  modalOk.onclick=function(){{
+    modal.style.display='none';
+  }};
+}})();
+</script>"""
+
+
+def _parse_form(body: bytes) -> dict[str, list[str]]:
+    return urllib.parse.parse_qs(body.decode("utf-8", errors="replace"))
+
+
+_job_store: dict[str, dict[str, Any]] = {}
+_job_lock = threading.Lock()
+
+
+def run_gui() -> int:
+    try:
+        headers = make_headers(DEFAULT_TOKEN)
+    except ValueError as exc:
+        print(f"[ERROR] {exc}")
+        return 1
+
+    base_url = DEFAULT_BASE_URL.rstrip("/")
+    port = GUI_PORT
+    url = f"http://127.0.0.1:{port}"
+
+    class GUIHandler(http.server.BaseHTTPRequestHandler):
+        def log_message(self, format: str, *args: int | str) -> None:
+            pass
+
+        def _send_json(self, data: dict[str, Any]) -> None:
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps(data).encode("utf-8"))
+
+        def do_GET(self) -> None:
+            if self.path.startswith("/status"):
+                parsed = urllib.parse.urlparse(self.path)
+                params = urllib.parse.parse_qs(parsed.query)
+                job_id = (params.get("job_id") or [""])[0]
+                with _job_lock:
+                    state = _job_store.get(job_id, {"done": False, "progress": [], "error": "Unknown job"})
+                self._send_json(state)
+                return
+            if self.path != "/":
+                self.send_error(404)
+                return
+            try:
+                raw_issues = fetch_open_issues(headers, base_url, DEFAULT_TASK_DAYS_RANGE)
+            except RuntimeError as exc:
+                body = _html_page(
+                    "Timesheet Error",
+                    f'<p class="error">Failed to fetch issues: {html.escape(str(exc))}</p>',
+                )
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.end_headers()
+                self.wfile.write(body.encode("utf-8"))
+                return
+
+            issue_rows: list[tuple[str, str]] = []
+            for item in raw_issues:
+                key = item.get("key", "")
+                fields = item.get("fields", {}) or {}
+                summary = (fields.get("summary") or "").strip() or "no summary"
+                if key:
+                    issue_rows.append((key, summary))
+
+            if not issue_rows:
+                body = _html_page("Timesheet", '<p class="error">No open issues found.</p>')
+            else:
+                today = datetime.now().date()
+                default_start = subtract_one_month(today)
+                form_body = _render_form(issue_rows, default_start, today)
+                body = _html_page("Timesheet", form_body)
+
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(body.encode("utf-8"))
+
+        def do_POST(self) -> None:
+            if self.path != "/run":
+                self.send_error(404)
+                return
+            content_length = int(self.headers.get("Content-Length", 0))
+            raw_body = self.rfile.read(content_length)
+            form = _parse_form(raw_body)
+
+            start_str = (form.get("start_date") or [""])[0]
+            end_str = (form.get("end_date") or [""])[0]
+
+            try:
+                start_date = datetime.strptime(start_str, "%Y-%m-%d").date()
+                end_date = datetime.strptime(end_str, "%Y-%m-%d").date()
+            except ValueError:
+                self._send_json({"error": "Invalid date format"})
+                return
+
+            if start_date > end_date:
+                self._send_json({"error": "Start date is later than end date"})
+                return
+
+            weighted_issues = []
+            for key in form:
+                if key.startswith("weight_"):
+                    issue_key = key[7:]
+                    vals = form[key]
+                    w = int(vals[0]) if vals and vals[0] in "12345" else 3
+                    weighted_issues.append(Issue(key=issue_key, summary="", weight=w))
+
+            if not weighted_issues:
+                self._send_json({"error": "No issues to process"})
+                return
+
+            job_id = f"{int(time.time() * 1000)}_{random.randint(0, 99999)}"
+            with _job_lock:
+                _job_store[job_id] = {"done": False, "progress": [], "created": 0, "skipped": 0, "errors": 0}
+
+            def run_job() -> None:
+                progress_log: list[str] = []
+
+                def on_progress(day: date, created_today: int, created: int, skipped: int, errs: int) -> None:
+                    if created_today > 0:
+                        progress_log.append(f"{day.isoformat()}: +{created_today}")
+                    else:
+                        progress_log.append(f"{day.isoformat()}: skipped")
+                    with _job_lock:
+                        _job_store[job_id]["progress"] = list(progress_log)
+
+                try:
+                    created, skipped_days, errors = run_timesheet(
+                        headers,
+                        base_url,
+                        weighted_issues,
+                        start_date,
+                        end_date,
+                        DEFAULT_HOURS,
+                        DEFAULT_MAX_DURATION,
+                        dry_run=False,
+                        progress_callback=on_progress,
+                    )
+                    days = working_days(start_date, end_date)
+                    with _job_lock:
+                        _job_store[job_id].update({
+                            "done": True,
+                            "created": created,
+                            "skipped": skipped_days,
+                            "errors": errors,
+                            "progress": progress_log,
+                        })
+                except Exception as exc:
+                    with _job_lock:
+                        _job_store[job_id].update({
+                            "done": True,
+                            "error": str(exc),
+                            "created": 0,
+                            "skipped": 0,
+                            "errors": 0,
+                        })
+
+            threading.Thread(target=run_job, daemon=True).start()
+            self._send_json({"job_id": job_id})
+
+    server = http.server.HTTPServer(("127.0.0.1", port), GUIHandler)
+    print(f"Timesheet UI: {url}")
+    if sys.platform == "darwin":
+        webbrowser.open(url)
+    server.serve_forever()
+    return 0
+
+
 def main() -> int:
     args = parse_args()
+    if args.gui:
+        return run_gui()
     try:
         headers = make_headers(args.token)
     except ValueError as exc:
@@ -515,53 +914,16 @@ def main() -> int:
         print("No working days (Mon-Fri) in the selected range.")
         return 0
 
-    created = 0
-    skipped_days = 0
-    errors = 0
-
-    for day in days:
-        try:
-            logged_seconds = calculate_logged_seconds_for_day(headers, base_url, day)
-        except RuntimeError as exc:
-            print(f"[WARN] Failed to calculate logged time for {day.isoformat()}: {exc}")
-            errors += 1
-            continue
-
-        target_seconds = daily_hours * 3600
-        remaining_seconds = target_seconds - logged_seconds
-        if remaining_seconds < 3600:
-            print(
-                f"[SKIP] {day.isoformat()}: already logged {logged_seconds / 3600:.2f}h, "
-                "remaining < 1h."
-            )
-            skipped_days += 1
-            continue
-
-        payloads = build_day_payloads(day, weighted_issues, remaining_seconds, max_task_hours)
-        if not payloads:
-            print(f"[SKIP] {day.isoformat()}: nothing to add.")
-            skipped_days += 1
-            continue
-
-        print(
-            f"[DAY] {day.isoformat()} logged={logged_seconds/3600:.2f}h "
-            f"to_add={sum(p['timeSpentSeconds'] for _, p in payloads)/3600:.2f}h"
-        )
-        for issue_key, payload in payloads:
-            if args.dry_run:
-                print(f"[DRY-RUN] {issue_key} {payload}")
-                created += 1
-                continue
-            try:
-                post_worklog(headers, base_url, issue_key, payload)
-                print(
-                    f"[OK] {issue_key} +{payload['timeSpentSeconds'] / 3600:.0f}h "
-                    f"started={payload['started']}"
-                )
-                created += 1
-            except RuntimeError as exc:
-                print(f"[ERR] {issue_key}: {exc}")
-                errors += 1
+    created, skipped_days, errors = run_timesheet(
+        headers,
+        base_url,
+        weighted_issues,
+        start_date,
+        end_date,
+        daily_hours,
+        max_task_hours,
+        dry_run=args.dry_run,
+    )
 
     print("\n=== Result ===")
     print(f"Working days: {len(days)}")

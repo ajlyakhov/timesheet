@@ -48,6 +48,7 @@ In `.env`:
 - `DEFAULT_HOURS = 4`
 - `DEFAULT_MAX_DURATION = 2`
 - `DEFAULT_TASK_DAYS_RANGE = 60`
+- `GUI_PORT = 8080` (web UI port when using `--gui`)
 
 You can:
 
@@ -79,6 +80,14 @@ Manager mode (minimal interaction: random weights 1-5, default dates/workload, c
 ```bash
 python3 timesheet.py --manager --token "<JIRA_TOKEN>"
 ```
+
+Web UI (token and URL from `.env`; on macOS opens browser automatically):
+
+```bash
+python3 timesheet.py --gui
+```
+
+The URL is printed on start (e.g. `http://127.0.0.1:8080`). Configure `GUI_PORT` in `.env` to change the port.
 
 ## Payload Format
 
