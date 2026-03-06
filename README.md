@@ -2,9 +2,11 @@
 
 ![Timesheets banner](assets/banner.webp)
 
-A Python 3.11 CLI utility for generating and sending Jira `worklog` entries using weighted task distribution.
+🤖🤖🤖 This is an AI-generated joke project. However, it could save you time on boring, routine tasks. 🤖🤖🤖
 
 ## What It Does
+
+A Python 3.11 CLI utility for generating and sending Jira `worklog` entries using weighted task distribution.
 
 1. Fetches open issues from the last `DEFAULT_TASK_DAYS_RANGE` days:
    - `assignee=currentUser()`
